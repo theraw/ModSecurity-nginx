@@ -136,10 +136,99 @@ ngx_inline char *ngx_str_to_char(ngx_str_t a, ngx_pool_t *p)
 }
 
 
+/* Helper function to extract rule ID from log message */
+static char *
+ngx_http_modsecurity_extract_rule_id(const char *log_message, ngx_pool_t *pool)
+{
+    char *rule_id_str = NULL;
+    const char *id_pos = NULL;
+    const char *id_start = NULL;
+    const char *id_end = NULL;
+    size_t id_len = 0;
+    int rule_id = 0;
+    char temp_buffer[16];
+
+    if (log_message == NULL) {
+        return NULL;
+    }
+
+    /* Look for " id " or "[id " pattern in the log message */
+    id_pos = strstr(log_message, " id ");
+    if (id_pos == NULL) {
+        id_pos = strstr(log_message, "[id ");
+    }
+    if (id_pos == NULL) {
+        id_pos = strstr(log_message, "id:");
+    }
+
+    if (id_pos != NULL) {
+        /* Move past the id identifier */
+        if (strncmp(id_pos, " id ", 4) == 0) {
+            id_start = id_pos + 4;
+        } else if (strncmp(id_pos, "[id ", 4) == 0) {
+            id_start = id_pos + 4;
+        } else if (strncmp(id_pos, "id:", 3) == 0) {
+            id_start = id_pos + 3;
+        }
+
+        if (id_start != NULL) {
+            /* Skip any quotes or spaces */
+            while (*id_start == '"' || *id_start == '\'' || *id_start == ' ') {
+                id_start++;
+            }
+
+            /* Find the end of the rule ID (first non-digit character) */
+            id_end = id_start;
+            while (*id_end >= '0' && *id_end <= '9') {
+                id_end++;
+            }
+
+            if (id_end > id_start) {
+                id_len = id_end - id_start;
+                if (id_len < sizeof(temp_buffer)) {
+                    strncpy(temp_buffer, id_start, id_len);
+                    temp_buffer[id_len] = '\0';
+                    
+                    rule_id = atoi(temp_buffer);
+                    if (rule_id > 0) {
+                        /* Allocate memory from nginx pool and copy rule ID */
+                        rule_id_str = ngx_palloc(pool, 16);
+                        if (rule_id_str != NULL) {
+                            ngx_snprintf((u_char *)rule_id_str, 16, "%d", rule_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return rule_id_str;
+}
+
+/* Helper function to add rule triggered header */
+static void
+ngx_http_modsecurity_add_rule_header(ngx_http_request_t *r, const char *rule_id)
+{
+    ngx_table_elt_t *rule_header = NULL;
+    
+    if (rule_id == NULL || r->header_sent) {
+        return;
+    }
+
+    rule_header = ngx_list_push(&r->headers_out.headers);
+    if (rule_header != NULL) {
+        ngx_str_set(&rule_header->key, "Rule-Triggered");
+        rule_header->value.data = (u_char *)rule_id;
+        rule_header->value.len = strlen(rule_id);
+        rule_header->hash = 1;
+    }
+}
+
 int
 ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_request_t *r, ngx_int_t early_log)
 {
     char *log = NULL;
+    char *rule_id = NULL;
     ModSecurityIntervention intervention;
     intervention.status = 200;
     intervention.url = NULL;
@@ -163,6 +252,14 @@ ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_re
     log = intervention.log;
     if (intervention.log == NULL) {
         log = "(no log message was specified)";
+    }
+
+    /* Extract rule ID from log message for blocked requests */
+    if (intervention.status != 200 && intervention.disruptive) {
+        rule_id = ngx_http_modsecurity_extract_rule_id(log, r->pool);
+        if (rule_id != NULL) {
+            dd("extracted rule ID: %s from log: %s", rule_id, log);
+        }
     }
 
     ngx_log_error(NGX_LOG_ERR, (ngx_log_t *)r->connection->log, 0, "%s", log);
@@ -221,6 +318,11 @@ ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_re
          *
          */
         msc_update_status_code(ctx->modsec_transaction, intervention.status);
+
+        /* Add Rule-Triggered header for blocked requests if rule ID was extracted */
+        if (rule_id != NULL) {
+            ngx_http_modsecurity_add_rule_header(r, rule_id);
+        }
 
         if (early_log) {
             dd("intervention -- calling log handler manually with code: %d", intervention.status);
