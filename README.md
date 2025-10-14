@@ -1,3 +1,31 @@
+# Modified modsec module
+
+It simply adds 2 headers which can help in some cases, with a simple html you can show your visitor what is blocking them instead of leaving a weird 403 error. In some cases its helpful for you, in some cases is helpful for scanners to change their commands to more sophisticated injections to bypass the rule id so use at your own risk.
+
+```bash
+> curl -I "https://julio.al/?id='or'1'='1"
+HTTP/1.1 403 Forbidden
+Server: nginx
+Date: Tue, 14 Oct 2025 21:19:34 GMT
+Content-Type: text/html
+Connection: keep-alive
+Rule-Triggered: 1002006
+Msg-Triggered: Accept */* + missing Accept-Language - likely non-browser
+Alt-Svc: h3=":443";ma=86400,h3-29=":443";ma=86400,h3-27=":443";ma=86400
+x-quic: h3
+X-Frame-Options: SAMEORIGIN
+X-Xss-Protection: 1; mode=block
+X-Content-Type-Options: nosniff
+Strict-Transport-Security: max-age=31536000; includeSubDomains; preload
+Access-Control-Allow-Origin: https://julio.al
+Access-Control-Allow-Methods: GET, POST, OPTIONS, PUT, DELETE
+Access-Control-Allow-Headers: Content-Type, Authorization
+Access-Control-Allow-Credentials: true
+```
+
+<img width="1245" height="747" alt="image" src="https://github.com/user-attachments/assets/1770db7f-242d-4505-aea8-a96ff4b34fbf" />
+
+
 
 <img src="https://github.com/SpiderLabs/ModSecurity/raw/v3/master/others/modsec.png" width="50%">
 
