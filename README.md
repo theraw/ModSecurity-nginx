@@ -23,7 +23,8 @@ Access-Control-Allow-Headers: Content-Type, Authorization
 Access-Control-Allow-Credentials: true
 ```
 
-<img width="1245" height="747" alt="image" src="https://github.com/user-attachments/assets/1770db7f-242d-4505-aea8-a96ff4b34fbf" />
+<img width="1393" height="693" alt="image" src="https://github.com/user-attachments/assets/086550f7-4e67-4c70-b6a0-49ddd895efb9" />
+
 
 
 
