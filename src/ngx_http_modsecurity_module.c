@@ -29,6 +29,14 @@
 #define strdup _strdup
 #endif
 
+/* 
+ * Define NGX_HTTP_MODSECURITY_RULE_HEADERS to enable rule ID and message headers
+ * This can be disabled at compile time for maximum performance if not needed
+ */
+#ifndef NGX_HTTP_MODSECURITY_RULE_HEADERS
+#define NGX_HTTP_MODSECURITY_RULE_HEADERS 1
+#endif
+
 static ngx_int_t ngx_http_modsecurity_init(ngx_conf_t *cf);
 static void *ngx_http_modsecurity_create_main_conf(ngx_conf_t *cf);
 static char *ngx_http_modsecurity_init_main_conf(ngx_conf_t *cf, void *conf);
@@ -136,99 +144,209 @@ ngx_inline char *ngx_str_to_char(ngx_str_t a, ngx_pool_t *p)
 }
 
 
-/* Helper function to extract rule ID from log message */
-static char *
-ngx_http_modsecurity_extract_rule_id(const char *log_message, ngx_pool_t *pool)
+#if NGX_HTTP_MODSECURITY_RULE_HEADERS
+/* Structure to hold extracted rule info to avoid multiple parsing passes */
+typedef struct {
+    int rule_id;
+    char *message;
+    size_t message_len;
+} ngx_http_modsecurity_rule_info_t;
+
+/* Optimized single-pass parser to extract both rule ID and message */
+static ngx_int_t
+ngx_http_modsecurity_parse_rule_info(const char *log_message, 
+    ngx_http_modsecurity_rule_info_t *rule_info)
 {
-    char *rule_id_str = NULL;
-    const char *id_pos = NULL;
-    const char *id_start = NULL;
-    const char *id_end = NULL;
-    size_t id_len = 0;
-    int rule_id = 0;
-    char temp_buffer[16];
-
-    if (log_message == NULL) {
-        return NULL;
+    const char *p, *end;
+    const char *id_start = NULL, *id_end = NULL;
+    const char *msg_start = NULL, *msg_end = NULL;
+    size_t log_len;
+    int found_items = 0;
+    
+    if (!log_message || !rule_info) {
+        return NGX_ERROR;
     }
-
-    /* Look for " id " or "[id " pattern in the log message */
-    id_pos = strstr(log_message, " id ");
-    if (id_pos == NULL) {
-        id_pos = strstr(log_message, "[id ");
+    
+    /* Initialize rule info */
+    rule_info->rule_id = 0;
+    rule_info->message = NULL;
+    rule_info->message_len = 0;
+    
+    /* Calculate log length with reasonable limit for performance */
+    log_len = strnlen(log_message, 1024);  /* Reduced to 1KB for better performance */
+    if (log_len == 0) {
+        return NGX_ERROR;
     }
-    if (id_pos == NULL) {
-        id_pos = strstr(log_message, "id:");
-    }
-
-    if (id_pos != NULL) {
-        /* Move past the id identifier */
-        if (strncmp(id_pos, " id ", 4) == 0) {
-            id_start = id_pos + 4;
-        } else if (strncmp(id_pos, "[id ", 4) == 0) {
-            id_start = id_pos + 4;
-        } else if (strncmp(id_pos, "id:", 3) == 0) {
-            id_start = id_pos + 3;
-        }
-
-        if (id_start != NULL) {
-            /* Skip any quotes or spaces */
-            while (*id_start == '"' || *id_start == '\'' || *id_start == ' ') {
-                id_start++;
-            }
-
-            /* Find the end of the rule ID (first non-digit character) */
-            id_end = id_start;
-            while (*id_end >= '0' && *id_end <= '9') {
-                id_end++;
-            }
-
-            if (id_end > id_start) {
-                id_len = id_end - id_start;
-                if (id_len < sizeof(temp_buffer)) {
-                    strncpy(temp_buffer, id_start, id_len);
-                    temp_buffer[id_len] = '\0';
-                    
-                    rule_id = atoi(temp_buffer);
-                    if (rule_id > 0) {
-                        /* Allocate memory from nginx pool and copy rule ID */
-                        rule_id_str = ngx_palloc(pool, 16);
-                        if (rule_id_str != NULL) {
-                            ngx_snprintf((u_char *)rule_id_str, 16, "%d", rule_id);
-                        }
+    
+    p = log_message;
+    end = log_message + log_len;
+    
+    /* Single pass through the log message */
+    while (p < end && found_items < 2) {
+        
+        /* Look for rule ID patterns */
+        if (rule_info->rule_id == 0) {
+            if ((p + 4 <= end) && 
+                ((*p == ' ' && ngx_strncmp(p, " id ", 4) == 0) ||
+                 (*p == '[' && ngx_strncmp(p, "[id ", 4) == 0))) {
+                
+                id_start = p + 4;
+                /* Skip quotes and spaces */
+                while (id_start < end && (*id_start == '"' || *id_start == '\'' || *id_start == ' ')) {
+                    id_start++;
+                }
+                
+                /* Find end of digits */
+                id_end = id_start;
+                while (id_end < end && *id_end >= '0' && *id_end <= '9') {
+                    id_end++;
+                }
+                
+                if (id_end > id_start && (id_end - id_start) < 10) {  /* Reasonable ID length */
+                    /* Parse rule ID directly without string copy */
+                    rule_info->rule_id = 0;
+                    const char *digit = id_start;
+                    while (digit < id_end) {
+                        rule_info->rule_id = rule_info->rule_id * 10 + (*digit - '0');
+                        digit++;
                     }
+                    found_items++;
+                    p = id_end;
+                    continue;
+                }
+            }
+            /* Check for "id:" pattern */
+            else if ((p + 3 <= end) && ngx_strncmp(p, "id:", 3) == 0) {
+                id_start = p + 3;
+                /* Skip spaces */
+                while (id_start < end && *id_start == ' ') {
+                    id_start++;
+                }
+                
+                /* Find end of digits */
+                id_end = id_start;
+                while (id_end < end && *id_end >= '0' && *id_end <= '9') {
+                    id_end++;
+                }
+                
+                if (id_end > id_start && (id_end - id_start) < 10) {
+                    /* Parse rule ID directly */
+                    rule_info->rule_id = 0;
+                    const char *digit = id_start;
+                    while (digit < id_end) {
+                        rule_info->rule_id = rule_info->rule_id * 10 + (*digit - '0');
+                        digit++;
+                    }
+                    found_items++;
+                    p = id_end;
+                    continue;
                 }
             }
         }
+        
+        /* Look for message patterns */
+        if (rule_info->message == NULL) {
+            if ((p + 5 <= end) && ngx_strncmp(p, "[msg ", 5) == 0) {
+                msg_start = p + 5;
+                /* Skip quotes and spaces */
+                while (msg_start < end && (*msg_start == '"' || *msg_start == '\'' || *msg_start == ' ')) {
+                    msg_start++;
+                }
+                
+                /* Find closing quote */
+                msg_end = msg_start;
+                while (msg_end < end && *msg_end != '"' && *msg_end != ']') {
+                    msg_end++;
+                }
+                
+                if (msg_end > msg_start) {
+                    rule_info->message = (char *)msg_start;  /* Point to original string */
+                    rule_info->message_len = msg_end - msg_start;
+                    if (rule_info->message_len > 256) {  /* Limit message length */
+                        rule_info->message_len = 256;
+                    }
+                    found_items++;
+                    p = msg_end;
+                    continue;
+                }
+            }
+        }
+        
+        p++;
     }
-
-    return rule_id_str;
+    
+    return (found_items > 0) ? NGX_OK : NGX_ERROR;
 }
 
-/* Helper function to add rule triggered header */
-static void
-ngx_http_modsecurity_add_rule_header(ngx_http_request_t *r, const char *rule_id)
+/* Optimized function to add both rule headers in one operation */
+static ngx_int_t
+ngx_http_modsecurity_add_rule_headers(ngx_http_request_t *r, 
+    ngx_http_modsecurity_rule_info_t *rule_info, ngx_pool_t *pool)
 {
     ngx_table_elt_t *rule_header = NULL;
+    ngx_table_elt_t *msg_header = NULL;
+    char *rule_id_str = NULL;
+    char *message_str = NULL;
     
-    if (rule_id == NULL || r->header_sent) {
-        return;
+    if (!rule_info || r->header_sent) {
+        return NGX_ERROR;
     }
-
-    rule_header = ngx_list_push(&r->headers_out.headers);
-    if (rule_header != NULL) {
-        ngx_str_set(&rule_header->key, "Rule-Triggered");
-        rule_header->value.data = (u_char *)rule_id;
-        rule_header->value.len = strlen(rule_id);
-        rule_header->hash = 1;
+    
+    /* Add Rule-Triggered header if we have a valid rule ID */
+    if (rule_info->rule_id > 0) {
+        rule_header = ngx_list_push(&r->headers_out.headers);
+        if (rule_header != NULL) {
+            /* Allocate minimal buffer for rule ID (max 10 digits + null) */
+            rule_id_str = ngx_palloc(pool, 12);
+            if (rule_id_str != NULL) {
+                /* Use nginx's optimized snprintf */
+                ngx_str_t rule_str;
+                rule_str.data = (u_char *)rule_id_str;
+                rule_str.len = ngx_snprintf((u_char *)rule_id_str, 12, "%d", rule_info->rule_id) 
+                              - (u_char *)rule_id_str;
+                
+                ngx_str_set(&rule_header->key, "Rule-Triggered");
+                rule_header->value = rule_str;
+                rule_header->hash = 1;
+            } else {
+                return NGX_ERROR;  /* Memory allocation failed */
+            }
+        } else {
+            return NGX_ERROR;  /* Header allocation failed */
+        }
     }
+    
+    /* Add Msg-Triggered header if we have a message */
+    if (rule_info->message != NULL && rule_info->message_len > 0) {
+        msg_header = ngx_list_push(&r->headers_out.headers);
+        if (msg_header != NULL) {
+            /* Allocate exact size needed + null terminator */
+            message_str = ngx_palloc(pool, rule_info->message_len + 1);
+            if (message_str != NULL) {
+                /* Use nginx's optimized memory copy */
+                ngx_memcpy(message_str, rule_info->message, rule_info->message_len);
+                message_str[rule_info->message_len] = '\0';
+                
+                ngx_str_set(&msg_header->key, "Msg-Triggered");
+                msg_header->value.data = (u_char *)message_str;
+                msg_header->value.len = rule_info->message_len;
+                msg_header->hash = 1;
+            } else {
+                return NGX_ERROR;  /* Memory allocation failed */
+            }
+        } else {
+            return NGX_ERROR;  /* Header allocation failed */
+        }
+    }
+    
+    return NGX_OK;
 }
+#endif /* NGX_HTTP_MODSECURITY_RULE_HEADERS */
 
 int
 ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_request_t *r, ngx_int_t early_log)
 {
     char *log = NULL;
-    char *rule_id = NULL;
     ModSecurityIntervention intervention;
     intervention.status = 200;
     intervention.url = NULL;
@@ -254,13 +372,19 @@ ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_re
         log = "(no log message was specified)";
     }
 
-    /* Extract rule ID from log message for blocked requests */
-    if (intervention.status != 200 && intervention.disruptive) {
-        rule_id = ngx_http_modsecurity_extract_rule_id(log, r->pool);
-        if (rule_id != NULL) {
-            dd("extracted rule ID: %s from log: %s", rule_id, log);
+#if NGX_HTTP_MODSECURITY_RULE_HEADERS
+    /* Extract rule info from log message for blocked requests (optimized single pass) */
+    ngx_http_modsecurity_rule_info_t rule_info = {0, NULL, 0};
+    ngx_int_t has_rule_info = NGX_ERROR;
+    
+    if (intervention.status != 200 && intervention.disruptive && log != NULL) {
+        has_rule_info = ngx_http_modsecurity_parse_rule_info(log, &rule_info);
+        if (has_rule_info == NGX_OK) {
+            dd("extracted rule info - ID: %d, message_len: %zu from log: %s", 
+               rule_info.rule_id, rule_info.message_len, log);
         }
     }
+#endif
 
     ngx_log_error(NGX_LOG_ERR, (ngx_log_t *)r->connection->log, 0, "%s", log);
 
@@ -319,10 +443,15 @@ ngx_http_modsecurity_process_intervention (Transaction *transaction, ngx_http_re
          */
         msc_update_status_code(ctx->modsec_transaction, intervention.status);
 
-        /* Add Rule-Triggered header for blocked requests if rule ID was extracted */
-        if (rule_id != NULL) {
-            ngx_http_modsecurity_add_rule_header(r, rule_id);
+#if NGX_HTTP_MODSECURITY_RULE_HEADERS
+        /* Add rule headers for blocked requests (optimized single operation) */
+        if (has_rule_info == NGX_OK) {
+            if (ngx_http_modsecurity_add_rule_headers(r, &rule_info, r->pool) != NGX_OK) {
+                dd("failed to add rule headers");
+                /* Continue processing - don't fail the request if header addition fails */
+            }
         }
+#endif
 
         if (early_log) {
             dd("intervention -- calling log handler manually with code: %d", intervention.status);
